@@ -15,6 +15,7 @@ import three_to_two  # 将三文件状态切换为双文件状态（禁用 GB）
 import two_to_three  # 将双文件状态切换为三文件状态（启用 GB）。
 
 # 实际 DLL 文件名：原预演中的 ac、ab、gb 分别对应这里三个文件。
+# 初始使用ac ab gb 代指3个dll文件
 DWMAPI_DLL = "dwmapi.dll"
 XINPUT_DLL = "xinput1_4.dll"
 OPEN_STEAM_TOOL_DLL = "OpenSteamTool.dll"
