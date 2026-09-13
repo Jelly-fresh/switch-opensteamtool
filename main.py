@@ -1,387 +1,396 @@
-"""程序入口：显示命令行菜单，并把 DLL、Steam、日志等功能连接起来。
+"""OpenSteamTool 图形界面入口。"""
+import os
+import subprocess
+import sys
+import time
+import webbrowser
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
+import re
+from pathlib import Path
+from urllib.request import Request, urlopen
+from html import unescape
+from urllib.parse import quote
 
-本文件不直接处理 Steam 配置或 DLL 重命名，而是调用其他模块完成。
-这样菜单逻辑集中在这里，新手以后增加菜单项也更容易维护。
-"""
+PROCESS_STARTED = time.perf_counter()
 
-import os  # 用于调用 Windows 打开文件夹。
-import shutil  # copy2() 能复制文件并尽量保留原文件的修改时间等信息。
-import subprocess  # 用于调用 taskkill 强制结束 Steam 进程。
-import webbrowser  # 使用系统默认浏览器打开网页。
+import logger
+import steam_accounts
+import three_to_two
+import two_to_three
 
-import logger  # 写入程序运行日志。
-import steam_accounts  # 读取 Steam 登录记录、保存绑定关系、启动 Steam。
-import three_to_two  # 将三文件状态切换为双文件状态（禁用 GB）。
-import two_to_three  # 将双文件状态切换为三文件状态（启用 GB）。
-
-# 实际 DLL 文件名：原预演中的 ac、ab、gb 分别对应这里三个文件。
-# 初始使用ac ab gb 代指3个dll文件
-DWMAPI_DLL = "dwmapi.dll"
-XINPUT_DLL = "xinput1_4.dll"
 OPEN_STEAM_TOOL_DLL = "OpenSteamTool.dll"
-# 菜单“打开网站”使用的固定网址。
 WEBSITE_URL = "https://3a.lol/"
-# OpenSteamTool 文件夹的基础名称；发行包可带版本后缀，例如 OpenSteamTool-1.4.8-Release (1)。
-OPEN_STEAM_TOOL_FOLDER_NAME = "opensteamtool"
-# 首次启动时保存 dwmapi.dll、xinput1_4.dll 原始备份的位置。
-ORIGIN_DLL_COPY_FOLDER = steam_accounts.APP_FOLDER / "OrigindllCopy"
+GITHUB_URL = "https://github.com/OpenSteam001/OpenSteamTool"
+MANIFEST_REPOSITORY = "Jelly-fresh/ManifestHub2copy"
 
 
-def gb_status():
-    """返回给用户看的 GB 状态文字。
+class StartupTimer:
+    """记录启动各阶段耗时，便于定位启动瓶颈。"""
+    def __init__(self):
+        self.started = PROCESS_STARTED
+        self.last = self.started
+        self.steps = []
 
-    这里不检查 .v1 文件；只要 OpenSteamTool.dll 存在，就表示 GB 已启用。
-    """
-    steam_folder = steam_accounts.get_steam_folder()
-    if not steam_folder:
-        return "未找到 Steam"
-    return "\033[4m已启用\033[0m" if (steam_folder / OPEN_STEAM_TOOL_DLL).exists() else "\033[4m未启用\033[0m"
+    def mark(self, name):
+        current = time.perf_counter()
+        self.steps.append((name, current - self.last))
+        self.last = current
 
-
-def get_open_steam_tool_folder():
-    """自动识别程序同级的 OpenSteamTool 文件夹，并兼容版本后缀。
-
-    优先使用名称完全等于 opensteamtool 的文件夹；没有时查找所有以该名称开头的
-    文件夹。出现多个发行版本时，使用最后修改的一份，通常就是最新解压的版本。
-    """
-    exact_folder = steam_accounts.APP_FOLDER / OPEN_STEAM_TOOL_FOLDER_NAME
-    if exact_folder.is_dir():
-        return exact_folder
-
-    candidates = [
-        folder for folder in steam_accounts.APP_FOLDER.iterdir()
-        if folder.is_dir() and folder.name.lower().startswith(OPEN_STEAM_TOOL_FOLDER_NAME)
-    ]
-    if candidates:
-        return max(candidates, key=lambda folder: folder.stat().st_mtime)
-    return exact_folder
+    def report(self):
+        total = time.perf_counter() - self.started
+        details = "，".join(f"{name}={elapsed * 1000:.1f}ms" for name, elapsed in self.steps)
+        return f"[启动耗时] 总计={total * 1000:.1f}ms；{details}"
 
 
-def create_origin_dll_copy():
-    """首次运行时备份当前的 dwmapi.dll 和 xinput1_4.dll。
+def app_icon_path():
+    resource_folder = Path(getattr(sys, "_MEIPASS", steam_accounts.APP_FOLDER))
+    return resource_folder / "app.ico"
 
-    如果备份文件夹已存在，程序只补齐缺失的真实 DLL，不会覆盖已有备份。
-    """
-    steam_folder = steam_accounts.get_steam_folder()
-    if not steam_folder:
-        logger.log("首次备份失败：未找到 Steam 安装目录")
-        return
+def tool_folder():
+    exact = steam_accounts.APP_FOLDER / "opensteamtool"
+    if exact.is_dir(): return exact
+    choices = [p for p in steam_accounts.APP_FOLDER.iterdir() if p.is_dir() and p.name.lower().startswith("opensteamtool")]
+    return max(choices, key=lambda p: p.stat().st_mtime) if choices else exact
 
-    ORIGIN_DLL_COPY_FOLDER.mkdir(exist_ok=True)
-    for filename in (DWMAPI_DLL, XINPUT_DLL):
-        source = steam_folder / filename
-        backup = ORIGIN_DLL_COPY_FOLDER / filename
-        # 已有真实文件备份时不覆盖，避免误替换用户最初保存的版本。
-        if backup.exists():
-            continue
-        if source.is_file():
-            shutil.copy2(source, backup)
-            logger.log(f"首次备份：{filename}")
+
+class App(tk.Tk):
+    def __init__(self):
+        startup = StartupTimer()
+        startup.mark("导入模块")
+        super().__init__()
+        startup.mark("创建 Tk 窗口")
+        self.title("OpenSteamTool 管理器")
+        self.iconbitmap(app_icon_path())
+        self.geometry("550x420"); self.minsize(500, 415)
+        startup.mark("设置窗口")
+        self.bindings = steam_accounts.load_bindings()
+        startup.mark("加载账号绑定")
+        self.build()
+        startup.mark("构建界面")
+        self.refresh()
+        startup.mark("刷新界面")
+        startup_report = startup.report()
+        print(startup_report)
+        logger.log(f"程序已打开（GUI）；{startup_report}")
+
+    def build(self):
+        box = ttk.Frame(self, padding=22); box.pack(fill="both", expand=True)
+        footer = ttk.Frame(box); footer.pack(side="bottom", fill="x")
+        project_link = tk.Label(footer, text="项目地址", foreground="#0563c1", cursor="hand2", font=("Microsoft YaHei UI", 9, "underline"))
+        project_link.pack(anchor="e")
+        project_link.bind("<Button-1>", lambda event: webbrowser.open("https://github.com/Jelly-fresh/switch-opensteamtool"))
+        ttk.Label(box, text="OpenSteamTool 管理器", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+        self.status = ttk.Label(box, font=("Microsoft YaHei UI", 11)); self.status.pack(anchor="w", pady=(8, 16))
+        self.one = ttk.Button(box, command=lambda: self.launch("slot_1", False)); self.one.pack(fill="x", pady=3)
+        self.two = ttk.Button(box, command=lambda: self.launch("slot_2", True)); self.two.pack(fill="x", pady=3)
+        controls = ttk.Frame(box); controls.pack(fill="x", pady=14)
+        items = [
+            ("切换 OpenSteamTool 状态", self.switch, 0, 0),
+            ("打开游戏清单文件夹", self.open_depotcache, 0, 1),
+            ("打开 OpenSteamTool", lambda: self.open_folder(tool_folder(), "OpenSteamTool"), 4, 0),
+            ("打开 OpenSteamTool 网站", lambda: webbrowser.open(GITHUB_URL), 1, 0),
+            ("打开lua文件夹", self.open_lua, 1, 1),
+            # 下面的直接改，gui界面也是，直接改后面的数字，横，竖）
+            ("打开 3A 社区", lambda: webbrowser.open(WEBSITE_URL), 2, 0),
+            ("校对游戏版本", self.check_game_version, 2, 1),
+            ("强制结束 Steam", self.stop, 3, 1),
+            ("设置", self.settings, 4, 1),
+        ]
+        for label, cmd, row, column in items:
+            ttk.Button(controls, text=label, command=cmd).grid(row=row, column=column, sticky="ew", padx=3, pady=4)
+        self.custom_site = ttk.Frame(controls)
+        self.custom_site.grid(row=3, column=0, sticky="ew", padx=3, pady=4)
+        self.custom_site.columnconfigure(0, weight=1)
+        # 右侧的 ⓘ 会占用一小段宽度；padding=(增加左侧内边距使主按钮文字仍以整组按钮为视觉中心。
+        self.custom_site_button = ttk.Button(self.custom_site, command=self.open_custom_website, padding=(35, 0, 0, 0))
+        self.custom_site_button.grid(row=0, column=0, sticky="ew")
+        ttk.Button(self.custom_site, text="ⓘ", width=3, command=self.edit_custom_website).grid(row=0, column=1)
+        controls.columnconfigure((0, 1), weight=1)
+        self.note = ttk.Label(box, foreground="#28783c", wraplength=500); self.note.pack(anchor="w", pady=12)
+
+    def popup(self, title):
+        """创建使用应用图标、并相对主窗口居中的普通弹窗。"""
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.iconbitmap(app_icon_path())
+        self.update_idletasks()
+        window.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - window.winfo_reqwidth()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - window.winfo_reqheight()) // 2)
+        window.geometry(f"+{x}+{y}")
+        return window
+
+    def refresh(self):
+        steam = steam_accounts.get_steam_folder(); enabled = bool(steam and (steam / OPEN_STEAM_TOOL_DLL).exists())
+        if steam:
+            state_text, color = ("已启用", "#d43c3c") if enabled else ("未启用", "#258a42")
+            self.status.config(text=f"OpenSteamTool 状态：{state_text}", foreground=color)
         else:
-            # 文件不存在时仍创建备份文件夹，并把原因记录下来，方便排查路径问题。
-            logger.log(f"首次备份失败，未找到：{filename}")
+            self.status.config(text="OpenSteamTool 安装目录：未找到", foreground="#333333")
+        a = self.bindings.get("slot_1", {}).get("persona_name", "未绑定") if self.bindings else "未绑定"
+        b = self.bindings.get("slot_2", {}).get("persona_name", "未绑定") if self.bindings else "未绑定"
+        self.one.config(text=f"禁用 OpenSteamTool 并启动：{a}"); self.two.config(text=f"启用 OpenSteamTool 并启动：{b}")
+        self.custom_site_button.config(text=steam_accounts.get_custom_website()[0])
 
+    def notify(self, text): self.note.config(text=text); self.refresh()
+    def state(self, enable):
+        steam = steam_accounts.get_steam_folder()
+        if not steam: raise FileNotFoundError("未找到 Steam 安装目录。")
+        active = (steam / OPEN_STEAM_TOOL_DLL).exists()
+        if enable and not active: two_to_three.run()
+        elif not enable and active: three_to_two.run()
 
-def create_manual_dll_backup():
-    """创建一个新的带数字备份文件夹，并复制当前 Steam 目录中的两个 DLL。
+    def launch(self, slot, enable):
+        if not self.bindings or slot not in self.bindings:
+            messagebox.showwarning("尚未绑定", "请先在“设置”中绑定 Steam 账号。", parent=self); return
+        try:
+            self.state(enable); steam_accounts.start_account(self.bindings[slot]); self.notify(f"正在启动 Steam 账号：{self.bindings[slot]['account_name']}")
+        except FileNotFoundError as e: messagebox.showerror("操作失败", str(e), parent=self)
 
-    初始备份使用 OrigindllCopy；手动备份从 OrigindllCopy1 开始。
-    程序会依次检查数字，找到第一个不存在的文件夹，因此绝不会覆盖旧备份。
-    """
-    steam_folder = steam_accounts.get_steam_folder()
-    if not steam_folder:
-        logger.log("手动重新备份失败：未找到 Steam 安装目录")
-        print("未找到 Steam 安装目录。")
-        return
+    def switch(self):
+        steam = steam_accounts.get_steam_folder()
+        try: self.state(not bool(steam and (steam / OPEN_STEAM_TOOL_DLL).exists())); self.notify("OpenSteamTool 状态已切换。")
+        except FileNotFoundError as e: messagebox.showerror("操作失败", str(e), parent=self)
 
-    number = 1
-    while (steam_accounts.APP_FOLDER / f"OrigindllCopy{number}").exists():
-        number += 1
-    backup_folder = steam_accounts.APP_FOLDER / f"OrigindllCopy{number}"
-    backup_folder.mkdir()
-    logger.log(f"用户手动创建 DLL 备份文件夹：{backup_folder.name}")
-
-    copied_count = 0
-    for filename in (DWMAPI_DLL, XINPUT_DLL):
-        source = steam_folder / filename
-        if source.is_file():
-            shutil.copy2(source, backup_folder / filename)
-            copied_count += 1
-            logger.log(f"手动备份成功：{filename} -> {backup_folder.name}")
-        else:
-            logger.log(f"手动备份失败，未找到：{filename}")
-
-    print(f"已创建 {backup_folder.name}，成功备份 {copied_count} 个 DLL 文件。")
-
-
-def install_open_steam_tool_v1_files():
-    """将 OpenSteamTool 文件夹的三个 DLL 改为 .v1，并复制到 Steam 目录。
-
-    操作前会检查所有文件；Steam 目录已有 .v1 目标时由用户确认是否覆盖。
-    文件列表按实际项目处理：OpenSteamTool.dll、dwmapi.dll、xinput1_4.dll。
-    """
-    steam_folder = steam_accounts.get_steam_folder()
-    open_steam_tool_folder = get_open_steam_tool_folder()
-    if not steam_folder:
-        logger.log("安装 OpenSteamTool V1 文件失败：未找到 Steam 安装目录")
-        print("未找到 Steam 安装目录。")
-        return
-    if not open_steam_tool_folder.is_dir():
-        logger.log(f"安装 OpenSteamTool V1 文件失败：未找到文件夹 {open_steam_tool_folder}")
-        print(f"未找到 OpenSteamTool 文件夹：{open_steam_tool_folder}")
-        return
-
-    filenames = (OPEN_STEAM_TOOL_DLL, DWMAPI_DLL, XINPUT_DLL)
-    existing_targets = []
-    for filename in filenames:
-        source = open_steam_tool_folder / filename
-        source_v1 = open_steam_tool_folder / f"{filename}.v1"
-        if not source.is_file():
-            logger.log(f"安装 OpenSteamTool V1 文件失败：源文件不存在 {source}")
-            print(f"源文件不存在：{source}")
-            return
-        # 源目录的 .v1 文件不能覆盖，否则会丢失该文件夹中已有的版本。
-        if source_v1.exists():
-            logger.log(f"安装 OpenSteamTool V1 文件取消：源目录已有 .v1 文件 {source_v1}")
-            print(f"OpenSteamTool 文件夹中已有 .v1 文件，未执行：{filename}")
-            return
-        if (steam_folder / f"{filename}.v1").exists():
-            existing_targets.append(filename)
-
-    # Steam 目录中的旧 .v1 文件可由用户决定是否覆盖。
-    if existing_targets:
-        print("Steam 目录中已存在以下 .v1 文件：")
-        for filename in existing_targets:
-            print(f"- {filename}.v1")
-        while True:
-            choice = input("1. 确认覆盖  2. 取消：").strip()
-            if choice == "1":
-                logger.log(f"用户确认覆盖 Steam 目录的 V1 文件：{', '.join(existing_targets)}")
-                break
-            if choice == "2":
-                logger.log(f"用户取消覆盖 Steam 目录的 V1 文件：{', '.join(existing_targets)}")
-                print("已取消安装 OpenSteamTool V1 文件。")
+    def open_folder(self, folder, desc):
+        if not folder.is_dir(): messagebox.showerror("未找到文件夹", f"未找到{desc}文件夹：\n{folder}", parent=self)
+        else: os.startfile(str(folder))
+    def open_lua(self):
+        steam = steam_accounts.get_steam_folder()
+        if steam: self.open_folder(steam / "config" / "lua", "游戏清单")
+        else: messagebox.showerror("操作失败", "未找到 Steam 安装目录。", parent=self)
+    def open_depotcache(self):
+        steam = steam_accounts.get_steam_folder()
+        if steam: self.open_folder(steam / "depotcache", "游戏清单 2")
+        else: messagebox.showerror("操作失败", "未找到 Steam 安装目录。", parent=self)
+    @staticmethod
+    def find_version_files(folder, number):
+        """查找文件名中编号前 N−1 位相同的文件，允许最后一位不同。"""
+        prefix = number[:-1]
+        if not folder.is_dir():
+            return []
+        try:
+            return [path for path in folder.rglob("*") if path.is_file() and any(token.startswith(prefix) for token in re.findall(r"\d+", path.name))]
+        except OSError:
+            return []
+    @staticmethod
+    def find_github_version_files(number, repository=MANIFEST_REPOSITORY):
+        """从公开 GitHub 分支网页读取该游戏编号对应的文件。"""
+        headers = {"User-Agent": "OpenSteamTool-Manager"}
+        try:
+            page_url = f"https://github.com/{repository}/tree/{number}"
+            with urlopen(Request(page_url, headers=headers), timeout=15) as response:
+                page = response.read().decode("utf-8", errors="replace")
+            pattern = rf'href="/{re.escape(repository)}/blob/{re.escape(number)}/([^"?#]+)"'
+            paths = list(dict.fromkeys(unescape(item) for item in re.findall(pattern, page)))
+            return ([(path, number) for path in paths], None)
+        except OSError as error:
+            return [], str(error)
+    def check_game_version(self):
+        steam = steam_accounts.get_steam_folder()
+        if not steam:
+            messagebox.showerror("操作失败", "未找到 Steam 安装目录。", parent=self); return
+        dialog = self.popup("校对游戏版本")
+        # 下面的几行设置弹窗大小、最小尺寸、模态化，并创建主框架和顶部输入行。
+        dialog.geometry("560x470"); dialog.minsize(500, 400)
+        dialog.transient(self)
+        main = ttk.Frame(dialog, padding=18); main.pack(fill="both", expand=True)
+        top = ttk.Frame(main); top.pack(fill="x")
+        ttk.Label(top, text="游戏编号：").pack(side="left")
+        number = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=number, width=28); entry.pack(side="left")
+        note = ttk.Label(main, text="按编号前 N−1 位搜索，输入编号的最后一位可与文件名不同。选择文件，双击打开文件夹。", foreground="#666")
+        note.pack(anchor="w", pady=(7, 10))
+        lists = []
+        # 两个本地列表框分别显示 lua 文件夹和 depotcache 文件夹的搜索结果。2 4 分别表示列表框的高度（显示行数）。
+        for title, rows in (("lua 文件夹搜索结果", 2), ("depotcache 文件夹搜索结果", 4)):
+            group = ttk.LabelFrame(main, text=title, padding=7); group.pack(fill="x", pady=4)
+            scrollbar = ttk.Scrollbar(group, orient="vertical")
+            view = tk.Listbox(group, height=rows, activestyle="none", yscrollcommand=scrollbar.set)
+            scrollbar.config(command=view.yview)
+            view.pack(side="left", fill="x", expand=True); scrollbar.pack(side="left", fill="y")
+            actions = ttk.Frame(group); actions.pack(side="left", fill="y", padx=(7, 0))
+            ttk.Button(actions, text="删\n除", width=2, command=lambda i=len(lists): delete_local(i)).pack(expand=True)
+            lists.append((view, []))
+        repository = steam_accounts.get_manifest_repository()
+        github_group = ttk.LabelFrame(main, text=f"GitHub 仓库搜索结果（{repository}）", padding=7)
+        github_group.pack(fill="x", pady=4)
+        github_scrollbar = ttk.Scrollbar(github_group, orient="vertical")
+        # height 6 ， 显示 6 行，
+        github_view = tk.Listbox(github_group, height=6, activestyle="none", yscrollcommand=github_scrollbar.set)
+        github_scrollbar.config(command=github_view.yview)
+        github_view.pack(side="left", fill="x", expand=True); github_scrollbar.pack(side="left", fill="y")
+        github_actions = ttk.Frame(github_group)
+        github_actions.pack(side="left", fill="y", padx=(7, 0))
+        github_paths = []
+        def selected_path(index):
+            view, paths = lists[index]
+            selected = view.curselection()
+            return paths[selected[0]] if selected and selected[0] < len(paths) else None
+        def delete_local(index):
+            path = selected_path(index)
+            if not path:
+                messagebox.showwarning("未选择文件", "请先选择要删除的文件。", parent=dialog)
                 return
-            print("请输入 1 或 2。")
+            try:
+                path.unlink()
+            except OSError as error:
+                messagebox.showerror("删除失败", f"无法删除文件：\n{error}", parent=dialog)
+                return
+            logger.log(f"删除版本文件：{path}")
+            refresh_local(index)
 
-    for filename in filenames:
-        source = open_steam_tool_folder / filename
-        source_v1 = open_steam_tool_folder / f"{filename}.v1"
-        target_v1 = steam_folder / f"{filename}.v1"
-        source.rename(source_v1)
-        shutil.copy2(source_v1, target_v1)
-        logger.log(f"安装 OpenSteamTool V1 文件：{source_v1} -> {target_v1}")
-    print("OpenSteamTool 的 3 个 V1 DLL 已复制到 Steam 目录。")
+        def refresh_local(index):
+            folder = (steam / "config" / "lua", steam / "depotcache")[index]
+            view, _ = lists[index]
+            paths = self.find_version_files(folder, number.get().strip())
+            lists[index] = (view, paths)
+            view.delete(0, tk.END)
+            for path in paths:
+                view.insert(tk.END, str(path))
+            if not paths:
+                view.insert(tk.END, "未找到匹配文件")
 
+        def open_file(index):
+            path = selected_path(index)
+            if path: os.startfile(str(path.parent))
+        for index, (view, _) in enumerate(lists):
+            view.bind("<Double-Button-1>", lambda event, i=index: open_file(i))
+        def github_selected():
+            selected = github_view.curselection()
+            return github_paths[selected[0]] if selected and selected[0] < len(github_paths) else None
+        def open_github_folder(event=None):
+            selected = github_selected()
+            if selected:
+                path, branch = selected
+                folder = path.rsplit("/", 1)[0] if "/" in path else ""
+                webbrowser.open(f"https://github.com/{repository}/tree/{branch}/{folder}".rstrip("/"))
+        github_view.bind("<Double-Button-1>", open_github_folder)
 
-def force_stop_steam():
-    """调用 Windows taskkill 强制结束 steam.exe，供 Steam 卡死时使用。"""
-    logger.log("用户选择菜单 7：强制结束 Steam 进程")
-    result = subprocess.run(
-        ["taskkill", "/F", "/IM", "steam.exe"],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    if result.returncode == 0:
-        logger.log("Steam 进程已被强制结束")
-        print("Steam 进程已强制结束。")
-    else:
-        logger.log("未能结束 Steam 进程：可能 Steam 未运行")
-        print("未发现可结束的 Steam 进程，或系统拒绝结束。")
+        def import_github_file():
+            selected = github_selected()
+            if not selected:
+                messagebox.showwarning("未选择文件", "请先选择要导入的 GitHub 文件。", parent=dialog)
+                return
+            path, branch = selected
+            suffix = Path(path).suffix.lower()
+            if suffix not in (".lua", ".manifest"):
+                messagebox.showinfo("无法导入", "只支持导入 .lua 文件和 .manifest 文件。", parent=dialog)
+                return
+            target_folder = steam / "config" / "lua" if suffix == ".lua" else steam / "depotcache"
+            target = target_folder / Path(path).name
+            raw_url = f"https://raw.githubusercontent.com/{repository}/{quote(branch, safe='')}/{quote(path, safe='/')}"
+            try:
+                target_folder.mkdir(parents=True, exist_ok=True)
+                with urlopen(Request(raw_url, headers={"User-Agent": "OpenSteamTool-Manager"}), timeout=15) as response:
+                    target.write_bytes(response.read())
+            except (OSError, ValueError) as error:
+                messagebox.showerror("导入失败", f"无法下载文件：\n{error}", parent=dialog)
+                return
+            logger.log(f"导入并替换版本文件：{target}")
+            refresh_local(0 if suffix == ".lua" else 1)
+            messagebox.showinfo("导入完成", f"文件已导入并替换：\n{target}", parent=dialog)
 
+        ttk.Button(github_actions, text="导\n入", width=2, command=import_github_file).pack(expand=True)
+        def verify():
+            value = number.get().strip()
+            if not value.isdigit() or len(value) < 2:
+                messagebox.showwarning("输入无效", "请输入有效数字。", parent=dialog); return
+            if steam_accounts.get_open_steamdb():
+                webbrowser.open(f"https://steamdb.info/app/{value}/depots/?branch=public")
+            folders = (steam / "config" / "lua", steam / "depotcache")
+            for index, folder in enumerate(folders):
+                number.set(value)
+                refresh_local(index)
+            nonlocal github_paths, repository
+            repository = steam_accounts.get_manifest_repository()
+            github_paths, github_error = self.find_github_version_files(value, repository)
+            github_view.delete(0, tk.END)
+            for path, _ in github_paths: github_view.insert(tk.END, path)
+            if not github_paths:
+                github_view.insert(tk.END, f"GitHub 读取失败：{github_error}" if github_error else "未找到匹配分支或文件")
+        ttk.Button(top, text="校验", command=verify).pack(side="left", padx=8)
+        entry.bind("<Return>", lambda event: verify()); entry.focus_set()
+    def open_custom_website(self):
+        label, url = steam_accounts.get_custom_website()
+        if not url.startswith(("https://", "http://")):
+            messagebox.showerror("网址无效", "请通过右侧 ⓘ 按钮设置以 http:// 或 https:// 开头的网址。", parent=self)
+            return
+        webbrowser.open(url)
+    def edit_custom_website(self):
+        label, url = steam_accounts.get_custom_website()
+        dialog = self.popup("编辑自定义网站")
+        dialog.transient(self); dialog.grab_set(); dialog.resizable(False, False)
+        form = ttk.Frame(dialog, padding=20); form.pack(fill="both", expand=True)
+        ttk.Label(form, text="按钮显示文字：").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        label_value = tk.StringVar(value=label)
+        label_entry = ttk.Entry(form, textvariable=label_value, width=38)
+        label_entry.grid(row=0, column=1, pady=(0, 8))
+        ttk.Label(form, text="目标网址：").grid(row=1, column=0, sticky="w")
+        url_value = tk.StringVar(value=url)
+        ttk.Entry(form, textvariable=url_value, width=38).grid(row=1, column=1)
+        ttk.Label(form, text="网址须以 https:// 或 http:// 开头。", foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 12))
+        buttons = ttk.Frame(form); buttons.grid(row=3, column=0, columnspan=2, sticky="e")
+        def save():
+            new_label, new_url = label_value.get().strip(), url_value.get().strip()
+            if not new_label or not new_url.startswith(("https://", "http://")):
+                messagebox.showerror("输入无效", "请填写按钮文字，以及以 http:// 或 https:// 开头的网址。", parent=dialog)
+                return
+            steam_accounts.set_custom_website(new_label, new_url)
+            dialog.destroy(); self.notify("自定义网站已保存。")
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="保存", command=save).pack(side="right", padx=(0, 6))
+        label_entry.focus_set()
+    def stop(self):
+        result = subprocess.run(["taskkill", "/F", "/IM", "steam.exe"], capture_output=True, text=True, errors="replace")
+        if result.returncode == 0: self.notify("Steam 进程已强制结束。")
+        else: messagebox.showinfo("提示", "未发现可结束的 Steam 进程，或系统拒绝结束。", parent=self)
 
-def choose_account(slot):
-    """让用户从 Steam 本机登录记录中选一个账号，作为指定槽位的绑定账号。"""
-    accounts = steam_accounts.list_accounts()
-    if not accounts:
-        print("未找到本机 Steam 登录记录。请先打开 Steam 并至少登录一次账号。")
-        return None
+    def bind_accounts(self):
+        accounts = steam_accounts.list_accounts()
+        if not accounts: messagebox.showwarning("未找到账号", "请先打开 Steam 并至少登录一次账号。", parent=self); return
+        win = self.popup("绑定 Steam 账号"); win.transient(self); win.grab_set()
+        labels = [f"{x['account_name']}（{x['persona_name']}）" for x in accounts]; values = [tk.StringVar(value=labels[0]), tk.StringVar(value=labels[0])]
+        for title, value in zip(("禁用 OpenSteamTool 后启动：", "启用 OpenSteamTool 后启动："), values):
+            row = ttk.Frame(win, padding=(18, 10)); row.pack(fill="x"); ttk.Label(row, text=title).pack(side="left"); ttk.Combobox(row, textvariable=value, values=labels, state="readonly", width=28).pack(side="left")
+        def save():
+            steam_accounts.save_bindings(accounts[labels.index(values[0].get())], accounts[labels.index(values[1].get())]); self.bindings = steam_accounts.load_bindings(); win.destroy(); self.notify("账号绑定已保存。")
+        ttk.Button(win, text="保存绑定", command=save).pack(pady=12)
 
-    # ANSI 转义码 4 表示下划线，0 表示恢复普通文字。
-    # Windows 10/11 的现代终端和 PowerShell 都支持这种显示方式。
-    underlined_action = (
-        "\033[4m禁用SteamTool\033[0m并启动"
-        if slot == "1"
-        else "\033[4m启用SteamTool\033[0m并启动"
-    )
-    print(f"\n请选择绑定到 {underlined_action} 的 Steam 账号：")
-    # enumerate(..., start=1) 让显示给用户的序号从 1 开始，更符合输入习惯。
-    for index, account in enumerate(accounts, start=1):
-        print(f"{index}. {account['account_name']}（{account['persona_name']}）")
-
-    # 循环提问，直到用户输入列表中有效的数字。
-    while True:
-        choice = input("请输入账号序号：").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(accounts):
-            return accounts[int(choice) - 1]
-        print("请输入列表中的有效序号。")
-
-
-def bind_accounts():
-    """依次绑定菜单 1 和菜单 2 使用的 Steam 账号，并保存到 settings.json。"""
-    print("\n账号绑定")
-    slot_1 = choose_account("1")
-    if not slot_1:
-        return None
-    slot_2 = choose_account("2")
-    if not slot_2:
-        return None
-
-    steam_accounts.save_bindings(slot_1, slot_2)
-    logger.log(f"完成 Steam 账号绑定：账号 1 = {slot_1['account_name']}，账号 2 = {slot_2['account_name']}")
-    print(f"绑定完成：1 = {slot_1['account_name']}，2 = {slot_2['account_name']}")
-    return {"slot_1": slot_1, "slot_2": slot_2}
-
-
-def run_file_change(enable_gb):
-    """按照传入的目标状态启用或禁用 GB，而不是盲目翻转状态。
-
-    enable_gb 为 True 时只在 GB 未启用时调用 two_to_three；
-    为 False 时只在 GB 已启用时调用 three_to_two。
-    """
-    steam_folder = steam_accounts.get_steam_folder()
-    if not steam_folder:
-        logger.log("切换失败：未找到 Steam 安装目录")
-        print("未找到 Steam 安装目录。")
-        return
-
-    open_steam_tool_path = steam_folder / OPEN_STEAM_TOOL_DLL
-    if enable_gb:
-        if open_steam_tool_path.exists():
-            logger.log("OpenSteamTool.dll 已启用，无需切换")
-        else:
-            logger.log("启用 OpenSteamTool.dll")
-            two_to_three.run()
-    else:
-        if open_steam_tool_path.exists():
-            logger.log("禁用 OpenSteamTool.dll")
-            three_to_two.run()
-        else:
-            logger.log("OpenSteamTool.dll 已禁用，无需切换")
-
-
-def run_bound_account(bindings, slot, enable_gb):
-    """先处理 GB 状态，再使用对应绑定账号启动 Steam。"""
-    binding = bindings[f"slot_{slot}"]
-    logger.log(f"用户选择菜单 {slot}：准备启动 Steam 账号 {binding['account_name']}")
-    run_file_change(enable_gb)
-    try:
-        steam_accounts.start_account(binding)
-        logger.log(f"已向 Steam 发送启动账号请求：{binding['account_name']}")
-        print(f"正在启动 Steam 账号：{binding['account_name']}")
-    except FileNotFoundError as error:
-        # 未安装 Steam 时只提示错误，菜单程序不会因此崩溃。
-        print(error)
-
-
-def run_switch():
-    """菜单 3 的旧式切换功能：根据当前状态切换到相反状态。"""
-    logger.log("用户选择菜单 3：自动切换 GB 状态")
-    steam_folder = steam_accounts.get_steam_folder()
-    enable_gb = bool(steam_folder) and not (steam_folder / OPEN_STEAM_TOOL_DLL).exists()
-    run_file_change(enable_gb=enable_gb)
-
-
-def open_folder(folder, description):
-    """用 Windows 资源管理器打开文件夹；找不到时显示清楚的路径提示。"""
-    if not folder.is_dir():
-        logger.log(f"打开{description}失败，文件夹不存在：{folder}")
-        print(f"未找到{description}文件夹：{folder}")
-        return
-    logger.log(f"用户打开{description}文件夹：{folder}")
-    os.startfile(str(folder))
-
-
-def settings(bindings):
-    """显示设置子菜单，并在用户选择返回时把最新绑定信息交还给主菜单。"""
-    while True:
-        print("\n设置")
-        print("1. 更换1、2的启动账号绑定")
-        print(f"2. 修改日志保留时间（当前：{steam_accounts.get_log_retention_days()} 天）")
-        print("3. 打开原始 DLL 备份")
-        print("4. 手动重新备份（请手动删除旧备份）")
-        print("5. 安装 OpenSteamTool 文件到 Steam")
-        print("6. 返回上一级")
-        choice = input("请输入选项：").strip()
-
-        if choice == "1":
-            # 换绑失败（例如没有 Steam 登录记录）时，保留原来的 bindings。
-            logger.log("用户在设置中选择：换绑 Steam 账号")
-            bindings = bind_accounts() or bindings
-        elif choice == "2":
-            value = input("请输入日志保留天数：").strip()
-            if value.isdigit() and int(value) > 0:
-                steam_accounts.set_log_retention_days(int(value))
-                # 修改保留时间后立刻清理一次已经过期的日志。
-                logger.clean_old_logs()
-                logger.log(f"用户修改日志保留时间为：{value} 天")
-                print("日志保留时间已更新。")
-            else:
-                print("请输入大于 0 的整数。")
-        elif choice == "3":
-            open_folder(ORIGIN_DLL_COPY_FOLDER, "原始 DLL 备份")
-        elif choice == "4":
-            create_manual_dll_backup()
-        elif choice == "5":
-            install_open_steam_tool_v1_files()
-        elif choice == "6":
-            logger.log("用户从设置返回主菜单")
-            return bindings
-        else:
-            print("无效选项。")
+    def settings(self):
+        win = self.popup("设置"); box = ttk.Frame(win, padding=20); box.pack()
+        ttk.Button(box, text="更换启动账号绑定", command=self.bind_accounts).pack(fill="x", pady=3)
+        repository = tk.StringVar(value=steam_accounts.get_manifest_repository())
+        repository_row = ttk.Frame(box); repository_row.pack(fill="x", pady=3)
+        ttk.Label(repository_row, text="GitHub 仓库：").pack(side="left")
+        ttk.Entry(repository_row, textvariable=repository, width=28).pack(side="left", fill="x", expand=True)
+        def save_repository():
+            value = repository.get().strip()
+            if not re.fullmatch(r"[^/\\\s]+/[^/\\\s]+", value):
+                messagebox.showerror("仓库格式无效", "请输入 GitHub 仓库格式：所有者/仓库名。", parent=win)
+                return
+            steam_accounts.set_manifest_repository(value)
+            self.notify("GitHub 搜索仓库已更新。")
+        ttk.Button(repository_row, text="保存", command=save_repository).pack(side="left", padx=(6, 0))
+        def days():
+            value = simpledialog.askinteger("日志保留时间", "请输入日志保留天数：", parent=win, minvalue=1)
+            if value: steam_accounts.set_log_retention_days(value); logger.clean_old_logs(); self.notify("日志保留时间已更新。")
+        ttk.Button(box, text=f"修改日志保留时间（当前 {steam_accounts.get_log_retention_days()} 天）", command=days).pack(fill="x", pady=3)
+        startup = tk.BooleanVar(value=steam_accounts.get_startup_enabled())
+        def toggle_startup():
+            try:
+                steam_accounts.set_startup_enabled(startup.get())
+                self.notify("已开启开机自启动。" if startup.get() else "已关闭开机自启动。")
+            except OSError as error:
+                startup.set(steam_accounts.get_startup_enabled())
+                messagebox.showerror("设置失败", f"无法修改开机自启动设置：\n{error}", parent=win)
+        ttk.Checkbutton(box, text="开机时自动启动管理器", variable=startup, command=toggle_startup).pack(anchor="w", pady=8)
+        open_steamdb = tk.BooleanVar(value=steam_accounts.get_open_steamdb())
+        def toggle_steamdb():
+            steam_accounts.set_open_steamdb(open_steamdb.get())
+            self.notify("已开启校验时自动弹出 SteamDB。" if open_steamdb.get() else "已关闭校验时自动弹出 SteamDB。")
+        ttk.Checkbutton(box, text="校验版本时自动弹出 SteamDB", variable=open_steamdb, command=toggle_steamdb).pack(anchor="w", pady=8)
 
 
-def main():
-    """程序主循环：完成首次备份、首次绑定，并持续响应用户的菜单输入。"""
-    logger.log("程序已打开")
-    create_origin_dll_copy()
-    # 没有 settings.json 或绑定数据不完整时，首次启动会进入账号绑定流程。
-    bindings = steam_accounts.load_bindings() or bind_accounts()
-
-    while True:
-        print(f"\nopensteamtool：{gb_status()}")
-        print(f"1. 禁用steamtool并启动 {bindings['slot_1']['persona_name']}" if bindings else "1. 禁用steamtool并启动账号 1（未绑定）")
-        print(f"2. 启用steamtool并启动 {bindings['slot_2']['persona_name']}" if bindings else "2. 启用steamtool并启动账号 2（未绑定）")
-        print("3. 切换steamtool状态")
-        print("4. 打开3A社区")
-        print("5. 打开游戏清单lua文件夹")
-        print("6. 打开OpenSteamTool")
-        print("7. 强制结束 Steam 进程")
-        print("8. 设置")
-
-        choice = input("请输入选项：").strip()
-        if choice in ("1", "2"):
-            if not bindings:
-                print("请先在设置中完成账号绑定。")
-            else:
-                run_bound_account(bindings, int(choice), enable_gb=(choice == "2"))
-        elif choice == "3":
-            run_switch()
-        elif choice == "4":
-            logger.log(f"用户选择菜单 4：打开网站 {WEBSITE_URL}")
-            webbrowser.open(WEBSITE_URL)
-        elif choice == "5":
-            logger.log("用户选择菜单 5：打开 Steam 游戏清单文件夹")
-            # 游戏清单位于 Steam 安装目录，而不是本程序目录。
-            steam_folder = steam_accounts.get_steam_folder()
-            if steam_folder:
-                open_folder(steam_folder / "config" / "lua", "游戏清单")
-            else:
-                logger.log("打开 Steam 游戏清单失败：未找到 Steam 安装目录")
-                print("未找到 Steam 安装目录。")
-        elif choice == "6":
-            logger.log("用户选择菜单 6：打开 OpenSteamTool 文件夹")
-            open_folder(get_open_steam_tool_folder(), "OpenSteamTool")
-        elif choice == "7":
-            force_stop_steam()
-        elif choice == "8":
-            logger.log("用户选择菜单 8：进入设置")
-            bindings = settings(bindings)
-        else:
-            print("无效选项。")
-
-
-# 只有直接运行 main.py（或运行打包 exe）时才启动菜单；被其他文件 import 时不执行。
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": App().mainloop()

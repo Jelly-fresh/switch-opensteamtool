@@ -146,6 +146,88 @@ def set_log_retention_days(days):
     _save_settings(data)
 
 
+def get_open_steamdb():
+    """读取校验版本时是否自动打开 SteamDB，默认开启。"""
+    value = _load_settings().get("open_steamdb", True)
+    return value if isinstance(value, bool) else True
+
+
+def set_open_steamdb(enabled):
+    """保存校验版本时是否自动打开 SteamDB。"""
+    data = _load_settings()
+    data["open_steamdb"] = bool(enabled)
+    _save_settings(data)
+
+
+def get_manifest_repository():
+    """读取版本校对使用的 GitHub 仓库。"""
+    value = _load_settings().get("manifest_repository", "Jelly-fresh/ManifestHub2copy")
+    return value.strip() if isinstance(value, str) and value.strip() else "Jelly-fresh/ManifestHub2copy"
+
+
+def set_manifest_repository(repository):
+    """保存版本校对使用的 GitHub 仓库。"""
+    data = _load_settings()
+    data["manifest_repository"] = repository.strip()
+    _save_settings(data)
+
+
+def get_custom_website():
+    """读取自定义网站按钮的文字与网址。"""
+    data = _load_settings()
+    label = data.get("custom_website_label", "打开自定义网站")
+    url = data.get("custom_website_url", "https://")
+    return (label if isinstance(label, str) and label.strip() else "打开自定义网站",
+            url if isinstance(url, str) and url.strip() else "https://")
+
+
+def set_custom_website(label, url):
+    """保存自定义网站按钮的文字与网址。"""
+    data = _load_settings()
+    data.update({"custom_website_label": label, "custom_website_url": url})
+    _save_settings(data)
+
+
+def _startup_command():
+    """返回 Windows 启动时要执行的命令，兼容源码运行和打包后的 exe。"""
+    if getattr(sys, "frozen", False):
+        executable = Path(sys.executable)
+        return f'"{executable}"'
+    python = Path(sys.executable)
+    pythonw = python.with_name("pythonw.exe")
+    executable = pythonw if pythonw.exists() else python
+    return f'"{executable}" "{Path(__file__).resolve()}"'
+
+
+def get_startup_enabled():
+    """读取开机自启动状态；注册表状态是实际生效状态。"""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            winreg.QueryValueEx(key, "OpenSteamToolManager")
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def set_startup_enabled(enabled):
+    """设置当前用户的开机自启动，并保存设置状态。"""
+    import winreg
+
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+        if enabled:
+            winreg.SetValueEx(key, "OpenSteamToolManager", 0, winreg.REG_SZ, _startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, "OpenSteamToolManager")
+            except FileNotFoundError:
+                pass
+    data = _load_settings()
+    data["startup_enabled"] = bool(enabled)
+    _save_settings(data)
+
+
 def find_bound_account(binding):
     """根据已绑定的 SteamID 在当前本机登录记录中查找账号；找不到则返回 None。"""
     return next((item for item in list_accounts() if item["steam_id"] == binding.get("steam_id")), None)
